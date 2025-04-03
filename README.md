@@ -51,8 +51,6 @@ To start both the web app and server, run:
 npm start
 ```
 
-## Moar notes
+## Development Notes
 
-I'm so sorry this is using the long dead create-react-app template! Was setting up Cloudflare Pages for the first time and their tutorial installed CRA 💀
-
-I'll move this stuff to Vite later
+This project uses Vite for fast development and optimized production builds.

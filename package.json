@@ -3,36 +3,63 @@
   "version": "0.1.0",
   "private": true,
   "homepage": ".",
+  "type": "module",
+  "overrides": {
+    "svgo": {
+      "css-select": {
+        "nth-check": "^2.0.1"
+      }
+    },
+    "resolve-url-loader": {
+      "postcss": "^8.4.31"
+    },
+    "youch": {
+      "cookie": "^0.7.0"
+    },
+    "esbuild": "^0.25.2",
+    "@svgr/webpack": {
+      "@svgr/plugin-svgo": {
+        "svgo": {
+          "css-select": {
+            "nth-check": "^2.0.1"
+          }
+        }
+      }
+    },
+    "react-scripts": {
+      "resolve-url-loader": {
+        "postcss": "^8.4.31"
+      }
+    }
+  },
   "dependencies": {
     "@emotion/react": "^11.11.4",
     "@emotion/styled": "^11.11.5",
     "@img-comparison-slider/react": "^8.0.2",
     "@mui/icons-material": "^5.15.21",
     "@mui/material": "^5.15.21",
-    "@testing-library/jest-dom": "^5.17.0",
-    "@testing-library/react": "^13.4.0",
     "@testing-library/user-event": "^13.5.0",
     "axios": "^1.7.2",
     "img-comparison-slider": "^8.0.6",
+    "jszip": "^3.10.1",
     "p-limit": "^6.0.0",
     "react": "^18.3.1",
     "react-best-gradient-color-picker": "^3.0.8",
     "react-dom": "^18.3.1",
     "react-hot-toast": "^2.4.1",
-    "react-scripts": "5.0.1",
+    "react-scripts": "^5.0.1",
     "react18-image-magnifier": "^4.0.2",
     "web-vitals": "^2.1.4"
   },
   "scripts": {
-    "start": "concurrently \"PORT=9877 react-scripts start\" \"cd server && ./run.sh\"",
-    "build": "react-scripts build",
-    "test": "react-scripts test",
-    "eject": "react-scripts eject",
-    "deploy": "npm run build && wrangler pages deploy ./build",
-    "preview": "npm run build && wrangler pages dev ./build",
+    "start": "concurrently \"npm run start-client\" \"npm run start-server\"",
+    "start-client": "vite --port 9877",
     "start-server": "cd server && ./run.sh",
+    "build": "vite build",
+    "preview": "vite preview",
     "setup-server": "cd server && chmod +x setup.sh && chmod +x run.sh && ./setup.sh",
-    "start-client": "PORT=9877 react-scripts start"
+    "deploy": "npm run build && wrangler pages deploy ./build",
+    "test": "vitest run"
   },
   "eslintConfig": {
     "extends": [
@@ -53,7 +80,21 @@
     ]
   },
   "devDependencies": {
+    "@svgr/plugin-svgo": "^8.1.0",
+    "@svgr/webpack": "^8.1.0",
+    "@testing-library/jest-dom": "^6.6.3",
+    "@testing-library/react": "^16.3.0",
+    "@vitejs/plugin-react": "^4.3.4",
     "concurrently": "^8.2.2",
-    "wrangler": "^3.63.1"
+    "css-select": "^5.1.0",
+    "jsdom": "^26.0.0",
+    "nth-check": "^2.1.1",
+    "postcss": "^8.5.3",
+    "resolve-url-loader": "^5.0.0",
+    "svgo": "^3.3.2",
+    "vite": "^6.2.4",
+    "vite-plugin-svgr": "^4.3.0",
+    "vitest": "^3.1.1",
+    "wrangler": "^4.6.0"
   }
 }

@@ -8,7 +8,7 @@ class ORMBGProcessor:
     def __init__(self, model_path):
         self.device = torch.device("cpu")
         self.net = ORMBG()
-        self.net.load_state_dict(torch.load(model_path, map_location="cpu"))
+        self.net.load_state_dict(torch.load(model_path, map_location="cpu", weights_only=True))
         self.net.eval()
 
     def to(self, device):

@@ -17,9 +17,10 @@ import logging
 import asyncio
 from datetime import datetime, timedelta
 import torch
-from ormbg import ORMBGProcessor 
+from ormbg import ORMBGProcessor
+from birefnet import BiRefNetProcessor
 from typing import Dict
-from contextlib import contextmanager
+from contextlib import contextmanager, asynccontextmanager
 
 from carvekit.ml.files.models_loc import download_all
 
@@ -40,7 +41,21 @@ from carvekit.trimap.generator import TrimapGenerator
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-# Add ORMBG model initialization
+# Add model initializations
+# Define lifespan context manager for FastAPI
+@asynccontextmanager
+async def lifespan(app):
+    # Startup: Create background task for cleanup
+    cleanup_task = asyncio.create_task(cleanup_old_videos())
+    yield
+    # Shutdown: Cancel the cleanup task gracefully
+    cleanup_task.cancel()
+    try:
+        await cleanup_task
+    except asyncio.CancelledError:
+        logger.info("Cleanup task cancelled during shutdown")
+
+# Initialize ORMBG
 ormbg_model_path = os.path.expanduser("~/.ormbg/ormbg.pth")
 try:
     ormbg_processor = ORMBGProcessor(ormbg_model_path)
@@ -53,7 +68,19 @@ except FileNotFoundError:
     print("Error: ORMBG model file not found. Please run 'npm run setup-server' to download it.")
     exit(1)
 
-app = FastAPI()
+# Initialize BiRefNet with GPU if available
+try:
+    use_gpu = torch.cuda.is_available()
+    birefnet_processor = BiRefNetProcessor(use_gpu=use_gpu)
+    logger.info(f"BiRefNet model loaded successfully with {'GPU' if use_gpu else 'CPU'}")
+except Exception as e:
+    logger.error(f"BiRefNet model initialization failed: {str(e)}")
+    print(f"Warning: BiRefNet model initialization failed: {str(e)}")
+    # We'll initialize it on first use
+    birefnet_processor = None
+
+# Initialize FastAPI with lifespan
+app = FastAPI(lifespan=lifespan)
 
 # Create temp_videos folder if it doesn't exist
 TEMP_VIDEOS_DIR = "temp_videos"
@@ -96,9 +123,12 @@ inspyrenet_model = Remover()
 inspyrenet_model.model.cpu()
 rembg_models = {
     'u2net': new_session('u2net'),
+    'u2netp': new_session('u2netp'),
     'u2net_human_seg': new_session('u2net_human_seg'),
     'isnet-general-use': new_session('isnet-general-use'),
-    'isnet-anime': new_session('isnet-anime')
+    'isnet-anime': new_session('isnet-anime'),
+    'sam': new_session('sam'),
+    'silueta': new_session('silueta')
 }
 
 # Initialize Carvekit models
@@ -134,15 +164,57 @@ def process_with_bria(image):
     no_bg_image.paste(image, mask=mask)
     return no_bg_image
 
+
 def process_with_ormbg(image):
     result = ormbg_processor.process_image(image)
     return result
 
+def process_with_birefnet(image):
+    global birefnet_processor
+    # Lazy loading if processor wasn't initialized successfully during startup
+    if birefnet_processor is None:
+        try:
+            logger.info("Attempting to initialize BiRefNet on first use")
+            use_gpu = torch.cuda.is_available()
+            birefnet_processor = BiRefNetProcessor(use_gpu=use_gpu)
+            logger.info(f"BiRefNet model initialized successfully with {'GPU' if use_gpu else 'CPU'}")
+        except Exception as e:
+            logger.error(f"BiRefNet model initialization failed on first use: {str(e)}")
+            raise ValueError(f"BiRefNet model initialization failed: {str(e)}")
+    
+    # Process the image
+    try:
+        logger.info("Processing image with BiRefNet")
+        result = birefnet_processor(image)
+        logger.info("BiRefNet processing completed successfully")
+        return result
+    except Exception as e:
+        logger.error(f"Error processing image with BiRefNet: {str(e)}")
+        # If BiRefNet processing fails, fall back to u2net
+        logger.info("Falling back to U2Net for background removal")
+        return process_with_rembg(image, model='u2net')
+
 def process_with_inspyrenet(image):
     return inspyrenet_model.process(image, type='rgba')
 
-def process_with_rembg(image, model='u2net'):
-    return rembg_remove(image, session=rembg_models[model])
+def process_with_rembg(image, model='u2net', **kwargs):
+    # Extract parameters from kwargs
+    alpha_matting = kwargs.get('alpha_matting', False)
+    alpha_matting_foreground_threshold = kwargs.get('alpha_matting_foreground_threshold', 240)
+    alpha_matting_background_threshold = kwargs.get('alpha_matting_background_threshold', 10)
+    alpha_matting_erode_size = kwargs.get('alpha_matting_erode_size', 10)
+    post_process_mask = kwargs.get('post_process_mask', False)
+    
+    # Apply custom parameters for logo-friendly processing
+    return rembg_remove(
+        image, 
+        session=rembg_models[model],
+        alpha_matting=alpha_matting,
+        alpha_matting_foreground_threshold=alpha_matting_foreground_threshold,
+        alpha_matting_background_threshold=alpha_matting_background_threshold,
+        alpha_matting_erode_size=alpha_matting_erode_size,
+        post_process_mask=post_process_mask
+    )
 
 def process_with_carvekit(image, model='u2net'):
     # Initialize segmentation network based on model input
@@ -209,10 +281,31 @@ def carvekit_video_model_context(model_name):
 gpu_lock = asyncio.Lock()
 
 @app.post("/remove_background/")
-async def remove_background(file: UploadFile = File(...), method: str = Form(...)):
+async def remove_background(
+    file: UploadFile = File(...), 
+    method: str = Form(...),
+    alpha_matting: bool = Form(False),
+    alpha_matting_foreground_threshold: int = Form(240),
+    alpha_matting_background_threshold: int = Form(10),
+    alpha_matting_erode_size: int = Form(10),
+    post_process_mask: bool = Form(False)
+):
     try:
+        # Validate file content type
+        content_type = file.content_type
+        if not content_type or not (content_type.startswith('image/') or content_type.startswith('video/')):
+            raise HTTPException(status_code=400, detail=f"Unsupported file type: {content_type}")
+        
         image_data = await file.read()
-        image = Image.open(io.BytesIO(image_data)).convert('RGB')
+        if not image_data:
+            raise HTTPException(status_code=400, detail="Empty file received")
+        
+        # Use a try/except block specifically for image opening
+        try:
+            image = Image.open(io.BytesIO(image_data)).convert('RGB')
+        except Exception as img_error:
+            logger.error(f"Failed to open image: {str(img_error)}")
+            raise HTTPException(status_code=400, detail=f"Invalid image format: {str(img_error)}")
         
         start_time = time.time()
 
@@ -227,10 +320,26 @@ async def remove_background(file: UploadFile = File(...), method: str = Form(...
                     finally:
                         inspyrenet_model.model.to('cpu')
                     return result
-            elif method in ['u2net_human_seg', 'isnet-general-use', 'isnet-anime']:
-                return await asyncio.to_thread(process_with_rembg, image, model=method)
+            elif method in ['u2net_human_seg', 'u2netp', 'isnet-general-use', 'isnet-anime', 'sam', 'silueta', 'rmbg2']:
+                # Pass all the model parameters to the processing function
+                model_params = {
+                    'alpha_matting': alpha_matting,
+                    'alpha_matting_foreground_threshold': alpha_matting_foreground_threshold,
+                    'alpha_matting_background_threshold': alpha_matting_background_threshold, 
+                    'alpha_matting_erode_size': alpha_matting_erode_size,
+                    'post_process_mask': post_process_mask
+                }
+                
+                if method == 'rmbg2':
+                    # For compatibility with the frontend, but rmbg2 isn't supported directly
+                    # Fallback to isnet-general-use which is similar in quality
+                    return await asyncio.to_thread(process_with_rembg, image, model='isnet-general-use', **model_params)
+                else:
+                    return await asyncio.to_thread(process_with_rembg, image, model=method, **model_params)
             elif method == 'ormbg':
                 return await asyncio.to_thread(process_with_ormbg, image)
+            elif method == 'birefnet':
+                return await asyncio.to_thread(process_with_birefnet, image)
             elif method in ['u2net', 'tracer', 'basnet', 'deeplab']:
                 async with gpu_lock:
                     try:
@@ -256,25 +365,44 @@ async def remove_background(file: UploadFile = File(...), method: str = Form(...
 
         return Response(content=content, media_type="image/png")
 
+    except HTTPException:
+        # Re-raise HTTP exceptions without modifying them
+        raise
     except Exception as e:
-        print(str(e))
+        logger.exception(f"Error in remove_background: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-async def process_frame(frame_path, method):
+async def process_frame(frame_path, method, **kwargs):
     img = Image.open(frame_path).convert('RGB')
+    
+    # Default model parameters (same as endpoint defaults)
+    model_params = {
+        'alpha_matting': kwargs.get('alpha_matting', False),
+        'alpha_matting_foreground_threshold': kwargs.get('alpha_matting_foreground_threshold', 240),
+        'alpha_matting_background_threshold': kwargs.get('alpha_matting_background_threshold', 10),
+        'alpha_matting_erode_size': kwargs.get('alpha_matting_erode_size', 10),
+        'post_process_mask': kwargs.get('post_process_mask', False)
+    }
     
     if method == 'bria':
         processed_frame = await asyncio.to_thread(process_with_bria, img)
-    elif method in ['u2net_human_seg', 'isnet-general-use', 'isnet-anime']:
-        processed_frame = await asyncio.to_thread(process_with_rembg, img, model=method)
+    elif method in ['u2net', 'u2netp', 'u2net_human_seg', 'isnet-general-use', 'isnet-anime', 'sam', 'silueta', 'rmbg2']:
+        if method == 'rmbg2':
+            # For compatibility with the frontend, but rmbg2 isn't supported directly
+            # Fallback to isnet-general-use which is similar in quality
+            processed_frame = await asyncio.to_thread(process_with_rembg, img, model='isnet-general-use', **model_params)
+        else:
+            processed_frame = await asyncio.to_thread(process_with_rembg, img, model=method, **model_params)
     elif method == 'ormbg':
         processed_frame = await asyncio.to_thread(process_with_ormbg, img)
+    elif method == 'birefnet':
+        processed_frame = await asyncio.to_thread(process_with_birefnet, img)
     else:
         raise ValueError("Invalid method")
     
     return processed_frame
 
-async def process_video(video_path, method, video_id):
+async def process_video(video_path, method, video_id, **model_params):
     try:
         processing_status[video_id] = {'status': 'processing', 'progress': 0, 'message': 'Initializing'}
         
@@ -364,7 +492,7 @@ async def process_video(video_path, method, video_id):
                     elif method in ['u2net', 'tracer', 'basnet', 'deeplab']:
                         processed_frame = model([img])[0]
                     else:
-                        processed_frame = await process_frame(frame_path, method)
+                        processed_frame = await process_frame(frame_path, method, **model_params)
 
                     processed_frame.save(frame_path, format='PNG')
                     progress = (i + 1) / total_frames * 100
@@ -421,9 +549,23 @@ async def process_video(video_path, method, video_id):
         logger.info(f"Cleaned up frames directory: {frames_dir}")
 
 @app.post("/remove_background_video/")
-async def remove_background_video(background_tasks: BackgroundTasks, file: UploadFile = File(...), method: str = Form(...)):
+async def remove_background_video(
+    background_tasks: BackgroundTasks, 
+    file: UploadFile = File(...), 
+    method: str = Form(...),
+    alpha_matting: bool = Form(False),
+    alpha_matting_foreground_threshold: int = Form(240),
+    alpha_matting_background_threshold: int = Form(10),
+    alpha_matting_erode_size: int = Form(10),
+    post_process_mask: bool = Form(False)
+):
     try:
         logger.info(f"Starting video background removal with method: {method}")
+        
+        # Validate file content type
+        content_type = file.content_type
+        if not content_type or not content_type.startswith('video/'):
+            raise HTTPException(status_code=400, detail=f"Unsupported file type: {content_type}. Must be a video format.")
         
         # Generate a unique filename for the uploaded video
         video_id = str(uuid.uuid4())
@@ -431,22 +573,37 @@ async def remove_background_video(background_tasks: BackgroundTasks, file: Uploa
         file_path = os.path.join(TEMP_VIDEOS_DIR, filename)
         
         # Save uploaded video to the temp_videos folder
+        content = await file.read()
+        if not content:
+            raise HTTPException(status_code=400, detail="Empty video file received")
+            
         with open(file_path, "wb") as buffer:
-            content = await file.read()
             buffer.write(content)
 
         logger.info(f"Video file saved: {file_path}")
         logger.info(f"File exists: {os.path.exists(file_path)}")
         logger.info(f"File size: {os.path.getsize(file_path)} bytes")
 
-        if not os.path.exists(file_path):
-            raise HTTPException(status_code=500, detail=f"Failed to create video file: {file_path}")
+        if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
+            raise HTTPException(status_code=500, detail=f"Failed to create valid video file: {file_path}")
 
+        # Pass model parameters to the background task
+        model_params = {
+            'alpha_matting': alpha_matting,
+            'alpha_matting_foreground_threshold': alpha_matting_foreground_threshold,
+            'alpha_matting_background_threshold': alpha_matting_background_threshold,
+            'alpha_matting_erode_size': alpha_matting_erode_size,
+            'post_process_mask': post_process_mask
+        }
+        
         # Start processing in the background
-        background_tasks.add_task(process_video, file_path, method, video_id)
+        background_tasks.add_task(process_video, file_path, method, video_id, **model_params)
         
         return {"video_id": video_id}
 
+    except HTTPException:
+        # Re-raise HTTP exceptions without modifying them
+        raise
     except Exception as e:
         logger.exception(f"Error in video processing: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error in video processing: {str(e)}")
@@ -467,9 +624,6 @@ async def get_status(video_id: str):
     
     return status
 
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(cleanup_old_videos())
     
 
 
